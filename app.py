@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import re
+import unicodedata
 from collections import defaultdict
 
 st.set_page_config(page_title="TFG - Fondos Next Generation", layout="wide")
@@ -16,21 +17,58 @@ with col_info:
     with st.popover("ℹ️ Sobre los datos", use_container_width=True):
         st.markdown("""
         **Origen y alcance metodológico**
-        * **Fuente:** API pública de la Base de Datos Nacional de Subvenciones (BDNS).
-        * **Alcance:** Incluye únicamente **subvenciones y ayudas directas**. No recoge grandes contratos públicos ni licitaciones de infraestructuras (que se tramitan en otras plataformas).
-        * **Criterio de extracción:** Los registros han sido filtrados mediante palabras clave vinculadas a los fondos europeos (*Next Generation, PRTR, MRR*, etc.). Por tanto, los datos representan una muestra representativa de las ayudas identificables y pueden no recoger el 100% de los fondos ejecutados.
-        * **Actualización:** Base de datos estática extraída en noviembre de 2026.
+- **Fuente:** API pública de la Base de Datos Nacional de Subvenciones (BDNS).
+- **Alcance:** Incluye únicamente **subvenciones y ayudas directas**. No recoge grandes contratos públicos ni licitaciones de infraestructuras (que se tramitan en otras plataformas).
+- **Criterio de extracción:** Los registros han sido filtrados mediante palabras clave vinculadas a los fondos europeos (*Next Generation, PRTR, MRR*, etc.). Por tanto, los datos representan una muestra representativa de las ayudas identificables y pueden no recoger el 100% de los fondos ejecutados.
+- **Actualización:** Base de datos estática extraída en noviembre de 2026.
         """)
-        
+
+
+def normalizar_texto(texto):
+    if pd.isna(texto):
+        return ""
+    texto_sin_tildes = "".join(
+        c for c in unicodedata.normalize("NFD", str(texto).lower())
+        if unicodedata.category(c) != "Mn"
+    )
+    return texto_sin_tildes
+
+
+SECTORES_KEYWORDS = {
+    "Sociosanitario, mayores y dependencia": [
+        "mayor", "mayores", "residencia", "residencias", "dependencia",
+        "cuidados", "larga duracion", "social", "discapacidad"
+    ],
+    "Energía, autoconsumo y eficiencia": [
+        "autoconsumo", "almacenamiento", "renovable", "renovables",
+        "eficiencia energetica", "termica", "energia"
+    ],
+    "Movilidad sostenible": [
+        "movilidad", "moves", "electrico", "electricos", "electrica",
+        "vehiculo", "vehiculos", "recarga"
+    ],
+    "Digitalización y modernización": [
+        "digital", "digitalizacion", "tecnologia", "tecnologico",
+        "ciberseguridad", "conectividad", "innovacion"
+    ],
+    "Industria, pymes y empleo": [
+        "pyme", "pymes", "industrial", "empleo", "formacion",
+        "contratacion", "capacitacion"
+    ]
+}
+
+
 @st.cache_data
 def cargar_datos():
     df = pd.read_parquet("datos_tfg.parquet")
     df['Año'] = pd.to_datetime(df['fechaConcesion'], errors='coerce').dt.year.astype('Int64')
     return df
 
+
 @st.cache_data
 def convertir_a_csv(dataframe):
     return dataframe.to_csv(index=False, sep=';').encode('utf-8-sig')
+
 
 df = cargar_datos()
 
@@ -40,6 +78,9 @@ for posible in ['convocatoria', 'descripcion', 'titulo']:
     if posible in df.columns:
         col_texto = posible
         break
+
+if col_texto:
+    df['_texto_norm'] = df[col_texto].apply(normalizar_texto)
 
 # --- FUNCIÓN PARA ANALIZAR PESO DE PALABRAS CLAVE ---
 STOPWORDS = {
@@ -54,24 +95,27 @@ STOPWORDS = {
     "autónoma", "gobierno", "ministerio", "consejeria", "consejería", "gestion", "gestión",
     "proyectos", "proyecto", "actuaciones", "medidas", "linea", "línea", "componente",
     "inversion", "inversión", "traves", "través", "ambito", "ámbito", "cargo", "apoyo",
-    "prtr", "mrr", "primera", "efectua", "efectúa", "correspondiente", "dentro"
+    "prtr", "mrr", "primera", "efectua", "efectúa", "correspondiente", "dentro", "concurrencia",
+    "régimen", "competitiva", "dirigidas", "convocan", "sector", "enero", "febrero", "marzo",
+    "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
 }
+
 
 @st.cache_data
 def calcular_peso_palabras(serie_texto, serie_importe, top_n=12):
     pesos_euros = defaultdict(float)
     conteo = defaultdict(int)
-    
+
     for texto, importe in zip(serie_texto.fillna(""), serie_importe.fillna(0)):
         palabras = set(re.findall(r'[a-záéíóúñü]{4,}', str(texto).lower()))
         for p in palabras:
             if p not in STOPWORDS:
                 pesos_euros[p] += importe
                 conteo[p] += 1
-                
+
     if not conteo:
         return pd.DataFrame()
-        
+
     df_palabras = pd.DataFrame({
         "Palabra Clave": list(conteo.keys()),
         "Concesiones": list(conteo.values()),
@@ -80,14 +124,27 @@ def calcular_peso_palabras(serie_texto, serie_importe, top_n=12):
     df_palabras["Importe (M€)"] = df_palabras["Importe Total (€)"] / 1e6
     return df_palabras.sort_values(by="Importe Total (€)", ascending=False).head(top_n)
 
+
 # --- BARRA LATERAL DE FILTROS CON BOTÓN ---
 st.sidebar.header("🔍 Filtros de búsqueda")
 
 with st.sidebar.form(key="form_filtros"):
     busqueda_empresa = st.text_input("Buscar por empresa o beneficiario:")
 
+    sector_seleccionado = "Todos los sectores"
     busqueda_clave = ""
     if col_texto:
+        opciones_sector = ["Todos los sectores"] + list(SECTORES_KEYWORDS.keys())
+        sector_seleccionado = st.selectbox(
+            "Ámbito / Sector temático:",
+            opciones_sector,
+            help="Agrupa convocatorias según palabras clave presentes en su texto (no es un filtro oficial CNAE de la BDNS)."
+        )
+        if sector_seleccionado != "Todos los sectores":
+            st.caption(
+                "Términos incluidos: " + ", ".join(SECTORES_KEYWORDS[sector_seleccionado])
+            )
+
         busqueda_clave = st.text_input(
             f"Buscar palabra clave en {col_texto}:",
             placeholder="Ej: digital, hidrógeno, turismo..."
@@ -113,10 +170,22 @@ with st.sidebar.form(key="form_filtros"):
 df_filtrado = df.copy()
 
 if busqueda_empresa:
-    df_filtrado = df_filtrado[df_filtrado['beneficiario'].str.contains(busqueda_empresa, case=False, na=False, regex=False)]
+    df_filtrado = df_filtrado[
+        df_filtrado['beneficiario'].str.contains(busqueda_empresa, case=False, na=False, regex=False)
+    ]
+
+if col_texto and sector_seleccionado != "Todos los sectores":
+    palabras_sector = [normalizar_texto(p) for p in SECTORES_KEYWORDS[sector_seleccionado]]
+    mascara_sector = pd.Series(False, index=df_filtrado.index)
+    for palabra in palabras_sector:
+        mascara_sector = mascara_sector | df_filtrado['_texto_norm'].str.contains(palabra, regex=False)
+    df_filtrado = df_filtrado[mascara_sector]
 
 if busqueda_clave and col_texto:
-    df_filtrado = df_filtrado[df_filtrado[col_texto].str.contains(busqueda_clave, case=False, na=False, regex=False)]
+    clave_norm = normalizar_texto(busqueda_clave)
+    df_filtrado = df_filtrado[
+        df_filtrado['_texto_norm'].str.contains(clave_norm, regex=False)
+    ]
 
 if ejercicios_seleccionados:
     df_filtrado = df_filtrado[df_filtrado['Año'].isin(ejercicios_seleccionados)]
@@ -195,7 +264,10 @@ st.caption("💡 Marca una o varias casillas a la izquierda (máximo 3 a la vez)
 df_vista = df_filtrado.sort_values(by="importe", ascending=False).head(100).reset_index(drop=True)
 df_vista.insert(0, "Nº", range(1, len(df_vista) + 1))
 
-columnas_visibles = [c for c in ['Nº', 'fechaConcesion', 'beneficiario', 'instrumento', 'importe', 'ayudaEquivalente', 'urlBR'] if c in df_vista.columns]
+columnas_visibles = [
+    c for c in ['Nº', 'fechaConcesion', 'beneficiario', 'instrumento', 'importe', 'ayudaEquivalente', 'urlBR']
+    if c in df_vista.columns
+]
 
 evento = st.dataframe(
     df_vista[columnas_visibles],
@@ -226,7 +298,10 @@ filas_seleccionadas = evento.selection.rows
 
 if filas_seleccionadas:
     if len(filas_seleccionadas) > MAX_FICHAS:
-        st.warning(f"Has seleccionado {len(filas_seleccionadas)} concesiones. Para compararlas en paralelo, solo se muestran las primeras {MAX_FICHAS}.")
+        st.warning(
+            f"Has seleccionado {len(filas_seleccionadas)} concesiones. "
+            f"Para compararlas en paralelo, solo se muestran las primeras {MAX_FICHAS}."
+        )
         filas_seleccionadas = filas_seleccionadas[:MAX_FICHAS]
 
     st.markdown(f"### ⚖️ Comparador de concesiones ({len(filas_seleccionadas)}/{MAX_FICHAS})")
@@ -237,16 +312,19 @@ if filas_seleccionadas:
         fila = df_vista.iloc[indice]
         emoji, color = COLORES[i]
         num_fila = int(fila["Nº"])
-        fecha_str = pd.to_datetime(fila['fechaConcesion']).strftime('%d/%m/%Y') if pd.notna(fila.get('fechaConcesion')) else "-"
+        fecha_str = (
+            pd.to_datetime(fila['fechaConcesion']).strftime('%d/%m/%Y')
+            if pd.notna(fila.get('fechaConcesion')) else "-"
+        )
 
         with cols[i]:
             with st.container(border=True):
                 st.markdown(f"#### {emoji} :{color}[Fila #{num_fila}]")
                 st.markdown(f"**{fila.get('beneficiario', 'No disponible')}**")
-                
+
                 st.metric("Importe concedido", f"{fila.get('importe', 0):,.2f} €")
                 st.metric("Ayuda equivalente", f"{fila.get('ayudaEquivalente', 0):,.2f} €")
-                
+
                 st.markdown(f"**Fecha:** {fecha_str} | **Código:** `{fila.get('codConcesion', '-')}`")
                 st.markdown(f"**Instrumento:** {fila.get('instrumento', '-')}")
 
